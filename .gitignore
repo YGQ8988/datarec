@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 测试用的临时镜像（每个 100MB，绝不进仓库）
+tests/img/
+
+# 系统与编辑器
+.DS_Store
+.idea/
+.vscode/
+
+# 本机工作记录
+.workbuddy/

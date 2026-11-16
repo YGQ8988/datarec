@@ -1,0 +1,60 @@
+name: build-windows
+
+# 为什么要有这个文件：
+# PyInstaller 不能跨平台编译 —— 在 macOS 上打不出 Windows 的 exe。
+# 所以借用 GitHub 提供的 Windows 机器来打，本地是 Mac 也能拿到成品。
+#
+# 触发方式：
+#   · 推到 main        → 构建，产物放在 Actions 的 artifact 里
+#   · 推一个 v* 标签   → 构建 + 自动创建 Release，exe 挂上去可直接下载（公开仓库无需登录）
+#   · 手动 Run workflow → 一样跑
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # 创建 Release 需要
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"       # 3.9~3.13 都能打，12 兼容性最稳
+
+      - name: 安装 PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: 打包
+        # --noconsole 双击不弹黑窗口；--onefile 单文件方便拷给别人
+        # 想让它启动就自动申请管理员权限，在这行末尾再加 --uac-admin
+        run: python -m PyInstaller --noconfirm --clean --noconsole --onefile --name DataRec datarec_gui.py
+
+      - name: 冒烟测试（产物存在且体积合理）
+        shell: pwsh
+        run: |
+          if (!(Test-Path dist\DataRec.exe)) { throw "没产出 exe" }
+          $mb = (Get-Item dist\DataRec.exe).Length / 1MB
+          Write-Host "产物体积: $([math]::Round($mb,1)) MB"
+          if ($mb -lt 5) { throw "体积异常，可能缺依赖" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DataRec-windows
+          path: dist/DataRec.exe
+          if-no-files-found: error
+
+      - name: 打 tag 时发布 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DataRec.exe
+          generate_release_notes: true
