@@ -20,8 +20,10 @@ from typing import Callable
 
 from . import carve as carve_mod
 from .device import Source, SourceError
+from .errors import Cancelled
 from .exfat import ExFatVolume, FileEntry
 from .formats import allowed_formats, category_of, normalize_ext
+from .state import ResumeState, carve_key, file_key
 from .verify import check_written
 
 MiB = 1024 * 1024
@@ -56,6 +58,7 @@ class Stats:
     suspect: int = 0
     skipped: int = 0
     duplicate: int = 0
+    resumed: int = 0          # 上次已经恢复过、本次直接跳过
     bytes: int = 0
     start_time: float = field(default_factory=time.time)
 
@@ -64,8 +67,7 @@ class Stats:
         return time.time() - self.start_time
 
 
-class Cancelled(RuntimeError):
-    """用户主动中止（GUI 点"停止"）。已恢复的部分照常保留并写报告。"""
+__all__ = ["Cancelled", "Result", "Stats", "Recoverer"]
 
 
 class Recoverer:
@@ -84,7 +86,8 @@ class Recoverer:
                  progress: Callable[[str], None] | None = None,
                  on_progress: Callable[[float, str], None] | None = None,
                  cancel: Callable[[], bool] | None = None,
-                 only_paths: set[str] | None = None):
+                 only_paths: set[str] | None = None,
+                 state: ResumeState | None = None):
         self.src = src
         self.vol = vol
         self.out_dir = os.path.abspath(out_dir)
@@ -103,6 +106,7 @@ class Recoverer:
         self.on_progress = on_progress
         self.cancel = cancel
         self.only_paths = only_paths
+        self.state = state
 
         self.results: list[Result] = []
         self.stats = Stats()
@@ -173,10 +177,19 @@ class Recoverer:
 
     # ------------------------------------------------------------------ 主流程
     def run(self) -> list[Result]:
+        try:
+            return self._run()
+        finally:
+            if self.state:                 # 中断也要把进度落盘，这是续扫的前提
+                self.state.flush(force=True)
+
+    def _run(self) -> list[Result]:
         self._progress(0.0, "读取目录结构…")
-        files, dirs, warnings = self.vol.walk()
+        files, dirs, warnings = self.vol.walk(should_stop=self._stopped)
         for w in warnings:
             self.say(f"  · 提示：{w}")
+        if self._stopped():
+            raise Cancelled()
 
         entries = [f for f in files if not f.is_dir]
         self.stats.scanned_files = len(entries)
@@ -207,6 +220,18 @@ class Recoverer:
         if self.only_paths is not None:      # GUI 里手工勾选的那几个
             picked = [e for e in picked if e.path in self.only_paths]
 
+        # 断点续扫：上次已经完整恢复过、文件还在输出目录里的，直接跳过
+        if self.state and self.state.count:
+            keep: list[FileEntry] = []
+            for ent in picked:
+                if self.state.has(file_key(ent.path), ent.size, self.out_dir):
+                    self.stats.resumed += 1
+                else:
+                    keep.append(ent)
+            if self.stats.resumed:
+                self.say(f"  · 续扫：{self.stats.resumed} 个文件上次已恢复，本次跳过")
+            picked = keep
+
         total = len(picked)
         for idx, ent in enumerate(picked, 1):
             if self._stopped():
@@ -228,6 +253,11 @@ class Recoverer:
         if self.do_carve:
             self._carve_phase()
         self._progress(1.0, "完成")
+
+        # 能走到这里说明整轮跑完了（没被 Cancel）；断点文件留着没意义，
+        # 删掉，下一轮就是干净的开始。中断时走不到这行，进度自然保留。
+        if self.state:
+            self.state.clear()
         return self.results
 
     def _claim_entry(self, ent: FileEntry) -> None:
@@ -515,6 +545,10 @@ class Recoverer:
             self._save_carved(item)
 
     def _save_carved(self, item: carve_mod.Carved) -> None:
+        key = carve_key(item.offset)
+        if self.state and self.state.has(key, item.size, self.out_dir):
+            self.stats.resumed += 1
+            return
         dest = self._out(".partial", f"carved_{item.offset:x}_{item.size}")
         try:
             digest, written = self._write_carved(dest, item)
@@ -546,6 +580,13 @@ class Recoverer:
                                    final, written, digest, item.fmt,
                                    "ok" if item.conf == "ok" else "warn", score, item.note,
                                    item.category))
+        if self.state and not self.dry_run:
+            try:
+                rel = os.path.relpath(final, self.out_dir)
+            except ValueError:
+                rel = os.path.basename(final)
+            self.state.mark(key, size=item.size, out=rel, sha256=digest, bytes=written,
+                            status="ok" if item.conf == "ok" else "warn")
 
     def _write_carved(self, dest: str, item: carve_mod.Carved) -> tuple[str, int]:
         digest = hashlib.sha256()
@@ -572,6 +613,14 @@ class Recoverer:
                                    normalize_ext(ent.name) or "-", status, score, note,
                                    category_of(ent.name)))
         self._bump(status, kind, size)
+        if self.state and out_path:
+            # 只有真正落到盘上的才算数；写失败的（skipped）留给下次重试
+            try:
+                rel = os.path.relpath(out_path, self.out_dir)
+            except ValueError:                 # Windows 上跨盘符
+                rel = os.path.basename(out_path)
+            self.state.mark(file_key(ent.path), size=ent.size or size, out=rel,
+                            status=status, sha256=digest, bytes=size)
 
     def _bump(self, status: str, kind: str, size: int) -> None:
         if status == "ok":

@@ -19,6 +19,7 @@ from .exfat import ExFatVolume
 from .formats import CATEGORIES, category_of
 from .recover import Recoverer
 from .report import human, summary_text, write_csv, write_markdown
+from .state import STATE_NAME, Fingerprint, ResumeState
 
 MiB = 1024 * 1024
 
@@ -226,6 +227,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec.add_argument("--keep-appledouble", action="store_true", help="保留 ._ 开头的资源叉文件")
     p_rec.add_argument("--keep-system", action="store_true", help="保留系统目录（.fseventsd 等）")
     p_rec.add_argument("--dry-run", action="store_true", help="只演练，不真正落盘")
+    p_rec.add_argument("--restart", action="store_true",
+                       help="忽略输出目录里的断点记录，全部重来")
     p_rec.add_argument("-q", "--quiet", action="store_true", help="不逐个文件打印进度")
     p_rec.set_defaults(func=cmd_recover)
 
@@ -260,6 +263,18 @@ def cmd_recover(args) -> int:
           f"{'' if not args.no_carve else '，不做雕刻'}")
     print()
 
+    state = ResumeState.open(out_dir, Fingerprint(
+        path=src.path, size=vol.info.size_bytes,
+        serial=vol.info.serial, offset=vol.info.offset))
+    if state.reset_note:
+        print(f"  注意：{state.reset_note}", file=sys.stderr)
+    if args.restart and state.count:
+        state.reset()
+        print("  已按 --restart 丢掉上次的进度记录", file=sys.stderr)
+    elif state.count:
+        print(f"  断点：输出目录里有上次的进度（{state.count} 条），已完成的会跳过；"
+              f"\n        想全部重来加 --restart")
+
     rec = Recoverer(
         src, vol, out_dir,
         types=types,
@@ -273,12 +288,16 @@ def cmd_recover(args) -> int:
         offset_start=args.start or 0,
         offset_end=args.end,
         verbose=not args.quiet,
+        state=None if args.dry_run else state,
     )
     try:
         results = rec.run()
     except KeyboardInterrupt:
         print("\n已中断，正在写入已完成的恢复报告…", file=sys.stderr)
         results = rec.results
+        if not args.dry_run:
+            print(f"进度已保存到 {os.path.join(out_dir, STATE_NAME)}，"
+                  "下次对同一个输出目录再跑一次就会接着来。", file=sys.stderr)
 
     if not args.dry_run:
         os.makedirs(out_dir, exist_ok=True)

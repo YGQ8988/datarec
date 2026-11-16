@@ -11,6 +11,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Callable
 
 from .device import Source, SourceError
 
@@ -510,14 +511,27 @@ class ExFatVolume:
 
     # ---------------------------------------------------------------- 遍历
     def walk(self, include_deleted: bool = True, max_depth: int = 32,
-             skip_system: bool = True) -> tuple[list[FileEntry], list[FileEntry], list[str]]:
-        """遍历整棵树。返回 (文件列表, 目录列表, 告警列表)。"""
+             skip_system: bool = True,
+             should_stop: Callable[[], bool] | None = None
+             ) -> tuple[list[FileEntry], list[FileEntry], list[str]]:
+        """遍历整棵树。返回 (文件列表, 目录列表, 告警列表)。
+
+        should_stop 返回 True 时提前收工，返回已经扫到的部分并附一条告警。
+        大目录树上中断要能用，所以检查点放在每个目录出栈处。
+        """
         files: list[FileEntry] = []
         dirs: list[FileEntry] = []
         warnings: list[str] = []
         seen: set[int] = set()
         stack: list[tuple[FileEntry, str, int]] = [(self._root_spec(), "/", 0)]
         while stack:
+            if should_stop is not None:
+                try:
+                    if should_stop():
+                        warnings.append(f"扫描被中断，结果不完整（已扫 {len(files)} 个文件）")
+                        break
+                except Exception:
+                    pass
             d_entry, path, depth = stack.pop()
             if depth > max_depth:
                 warnings.append(f"目录层级超过 {max_depth}，跳过 {path}")

@@ -7,6 +7,7 @@ import time
 from collections import Counter, defaultdict
 
 from .formats import CATEGORIES
+from .state import STATE_NAME
 
 STATUS_LABEL = {
     "ok": "完整",
@@ -78,6 +79,10 @@ def write_markdown(path: str, results, stats, volume, source: str, out_dir: str,
     for k, label in STATUS_LABEL.items():
         add(f"| {label} | {by_status.get(k, 0)} |")
     add("")
+    if getattr(stats, "resumed", 0):
+        add(f"> 断点续扫：本次跳过了 {stats.resumed} 个上次已经恢复好的文件"
+            f"（记录在输出目录的 `{STATE_NAME}` 里）。")
+        add("")
 
     add("### 按类别统计")
     add("")
@@ -145,6 +150,7 @@ def summary_text(results, stats, volume) -> str:
         f"  完整 {by_status.get('ok', 0)} ｜ 可用 {by_status.get('warn', 0)} "
         f"｜ 可疑 {by_status.get('suspect', 0)} ｜ 重复 {by_status.get('duplicate', 0)} "
         f"｜ 跳过 {by_status.get('skipped', 0)}",
+        *([f"  续扫跳过 {stats.resumed} 个（上次已恢复）"] if getattr(stats, "resumed", 0) else []),
         f"  恢复到 {human(stats.bytes)}，耗时 {stats.elapsed:.1f} 秒",
         "",
     ]

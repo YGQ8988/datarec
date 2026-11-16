@@ -28,6 +28,7 @@ from .exfat import ExFatVolume
 from .formats import CATEGORIES, category_of
 from .recover import SYSTEM_DIRS, Cancelled, Recoverer
 from .report import write_csv, write_markdown
+from .state import STATE_NAME, Fingerprint, ResumeState, file_key
 
 MiB = 1024 * 1024
 
@@ -137,7 +138,7 @@ class App(tk.Tk):
         self.cat_vars: dict[str, tk.BooleanVar] = {}
 
         self._build()
-        self.after(80, self._drain)
+        self._drain_job = self.after(80, self._drain)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(120, self.refresh_disks)
 
@@ -501,6 +502,7 @@ class App(tk.Tk):
         self.entries = []
         self.selected.clear()
         self.tree.delete(*self.tree.get_children())
+        self.cancel_evt.clear()
         self._set_busy(True, can_start=False)
         self.pbar.configure(mode="indeterminate")
         self.pbar.start(12)
@@ -511,7 +513,7 @@ class App(tk.Tk):
             try:
                 src = Source(path)
                 vol = ExFatVolume.open(src, offset=None)
-                files, dirs, warns = vol.walk()
+                files, dirs, warns = vol.walk(should_stop=self.cancel_evt.is_set)
                 self.queue.put(("scanned", (src, vol, files, warns)))
             except SourceError as exc:
                 self.queue.put(("error", str(exc)))
@@ -525,10 +527,16 @@ class App(tk.Tk):
         src, vol, files, warns = payload
         self.src, self.vol = src, vol
         self.entries = [f for f in files if not f.is_dir]
+        stopped = False
         self.pbar.stop()
         self.pbar.configure(mode="determinate")
         self.pbar["value"] = 0
-        self.pbar_lbl.configure(text="扫描完成")
+        if self.cancel_evt.is_set():
+            stopped = True                     # 用户中途按了停止，结果不完整
+            self.cancel_evt.clear()
+            self.pbar_lbl.configure(text="扫描已中断")
+        else:
+            self.pbar_lbl.configure(text="扫描完成")
 
         info = vol.info.summary()
         live = sum(1 for f in self.entries if not f.deleted)
@@ -536,6 +544,9 @@ class App(tk.Tk):
         self.log(f"卷大小 {info.get('卷大小', '?')}，簇大小 {info.get('簇大小', '?')}，"
                  f"引导扇区在偏移 {info.get('引导扇区偏移', '?')}", "ok")
         self.log(f"找到活动文件 {live} 个，已删除（可恢复）{gone} 个")
+        if stopped:
+            self.log(f"扫描被中断，只列出了已经扫到的 {len(self.entries)} 个文件。"
+                     "再点「开始扫描」会重新完整扫一遍。", "warn")
         if vol.info.volume_flags & 0x2:
             self.log("卷的脏标志位是开着的 —— 上次没有正常卸载，符合误拔特征", "warn")
         for w in warns[:5]:
@@ -704,6 +715,29 @@ class App(tk.Tk):
             return
         gone = sum(1 for e in targeted if e.deleted)
         total_size = sum(e.size for e in targeted)
+
+        # ---- 断点续扫：上次没跑完的话，先问一句接着来还是重来
+        state = ResumeState.open(out, self._fingerprint())
+        if state.reset_note:
+            self.log(state.reset_note, "warn")
+        already = sum(1 for e in targeted
+                      if state.has(file_key(e.path), e.size, out))
+        if already:
+            ans = messagebox.askyesnocancel(
+                "发现上次的进度",
+                f"输出目录里记着上次的恢复进度，这批文件里有 {already} 个已经恢复好了。\n\n"
+                f"「是」接着上次继续，跳过这 {already} 个\n"
+                "「否」全部重来（已有的文件不会被覆盖，会另存成 xxx_1）\n"
+                "「取消」先不开始")
+            if ans is None:
+                return
+            if not ans:
+                state.reset()
+                already = 0
+                self.log("已选择全部重来，忽略上次的进度记录")
+            else:
+                self.log(f"接着上次继续，跳过已完成 {already} 个文件")
+
         if not messagebox.askokcancel(
                 "确认开始",
                 f"将恢复 {len(targeted)} 个文件（其中已删除 {gone} 个），"
@@ -742,6 +776,7 @@ class App(tk.Tk):
                     on_progress=lambda f, label: self.queue.put(("prog", (f, label))),
                     cancel=self.cancel_evt.is_set,
                     only_paths=only_paths,
+                    state=state,
                 )
                 results = rec.run()
                 self.queue.put(("finished", (rec, results, out, None)))
@@ -759,8 +794,16 @@ class App(tk.Tk):
         if not self.busy:
             return
         self.cancel_evt.set()
-        self.log("正在停止…（当前文件写完就停）", "warn")
+        self.log("正在停止…（当前文件写完就停，进度会存下来）", "warn")
         self.stop_btn.configure(state="disabled")
+
+    def _fingerprint(self) -> Fingerprint:
+        """当前数据源的指纹，用来判断输出目录里的旧进度是不是这同一个卷的。"""
+        info = self.vol.info if self.vol else None
+        return Fingerprint(path=self.src.path if self.src else "",
+                           size=info.size_bytes if info else 0,
+                           serial=info.serial if info else 0,
+                           offset=info.offset if info else 0)
 
     def _on_finished(self, payload) -> None:
         rec, results, out, state = payload
@@ -782,6 +825,10 @@ class App(tk.Tk):
         self.log("─" * 46)
         if state == "cancelled":
             self.log("已停止。已恢复的文件和报告都保留在输出目录。", "warn")
+            self.log(f"进度已保存（{STATE_NAME}）。下次选同一个输出目录，"
+                     "会问你要不要接着上次继续。", "warn")
+        if s.resumed:
+            self.log(f"其中 {s.resumed} 个文件是上次已经恢复好的，本次直接跳过。")
         self.log(f"恢复完成：完好 {s.ok} 个，基本完好 {s.warn} 个，"
                  f"可疑 {s.suspect} 个，重复 {s.duplicate} 个，跳过 {s.skipped} 个",
                  "ok" if s.ok else "warn")
@@ -828,7 +875,10 @@ class App(tk.Tk):
                     self._on_error(payload)
         except queue.Empty:
             pass
-        self.after(80, self._drain)
+        try:
+            self._drain_job = self.after(80, self._drain)
+        except tk.TclError:          # 窗口已经销毁，别再把回调挂上去
+            pass
 
     def _on_error(self, text: str) -> None:
         self.pbar.stop()
@@ -857,6 +907,18 @@ class App(tk.Tk):
             self.cancel_evt.set()
         self._close_source()
         self.destroy()
+
+    def destroy(self) -> None:
+        """关窗前把还在排队的 after 回调摘掉，否则 Tk 会报 invalid command。"""
+        for attr in ("_drain_job", "_filter_job"):
+            job = getattr(self, attr, None)
+            if job:
+                try:
+                    self.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
+        super().destroy()
 
 
 def main() -> int:
